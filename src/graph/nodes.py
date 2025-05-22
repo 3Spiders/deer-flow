@@ -103,37 +103,123 @@ def planner_node(
             }
         ]
 
-    if AGENT_LLM_MAP["planner"] == "basic":
-        llm = get_llm_by_type(AGENT_LLM_MAP["planner"]).with_structured_output(
-            Plan,
-            method="json_mode",
-        )
-    else:
-        llm = get_llm_by_type(AGENT_LLM_MAP["planner"])
-
+    llm_type = AGENT_LLM_MAP["planner"]
+    
     # if the plan iterations is greater than the max plan iterations, return the reporter node
     if plan_iterations >= configurable.max_plan_iterations:
         return Command(goto="reporter")
 
     full_response = ""
-    if AGENT_LLM_MAP["planner"] == "basic":
+    
+    if llm_type == "basic":
+        # For basic models, use structured output
+        llm = get_llm_by_type(llm_type).with_structured_output(
+            Plan,
+            method="json_mode",
+        )
         response = llm.invoke(messages)
         full_response = response.model_dump_json(indent=4, exclude_none=True)
-    else:
+    elif llm_type == "reasoning":
+        # For reasoning models like DeepSeek R1 or OpenAI O1
+        llm = get_llm_by_type(llm_type)
+        
+        # Add reasoning instructions to the messages
+        reasoning_instruction = {
+            "role": "user",
+            "content": (
+                "Please think step by step to create a comprehensive research plan. "
+                "First, analyze the task carefully to understand what information is needed. "
+                "Then, break down the research into logical steps, considering dependencies between steps. "
+                "For each step, determine whether web search is needed and what specific information to collect. "
+                "Classify each step as either 'research' (gathering information) or 'processing' (analyzing information). "
+                "\n\n"
+                "After your reasoning, format your response as a valid JSON object following this structure:\n"
+                "```json\n"
+                "{\n"
+                '  "locale": "en-US",\n'
+                '  "has_enough_context": true/false,\n'
+                '  "thought": "Your detailed reasoning about the plan",\n'
+                '  "title": "Title of the research plan",\n'
+                '  "steps": [\n'
+                '    {\n'
+                '      "need_web_search": true/false,\n'
+                '      "title": "Step title",\n'
+                '      "description": "Detailed description of what to research",\n'
+                '      "step_type": "research" or "processing"\n'
+                '    }\n'
+                '  ]\n'
+                "}\n"
+                "```\n"
+                "Make sure your JSON is valid and properly formatted. Place the JSON inside triple backticks as shown above."
+            ),
+        }
+        messages.append(reasoning_instruction)
+        
+        # Stream the response for reasoning models
         response = llm.stream(messages)
         for chunk in response:
             full_response += chunk.content
+    else:
+        # Default case for other model types
+        llm = get_llm_by_type(llm_type)
+        response = llm.stream(messages)
+        for chunk in response:
+            full_response += chunk.content
+    
     logger.debug(f"Current state messages: {state['messages']}")
     logger.info(f"Planner response: {full_response}")
 
     try:
-        curr_plan = json.loads(repair_json_output(full_response))
+        # For reasoning models, we need to extract the JSON from the response
+        if llm_type == "reasoning":
+            # Extract JSON from the reasoning model's response
+            # Look for JSON pattern between triple backticks or just find the JSON object
+            import re
+            
+            # First try to find JSON between triple backticks with json language marker
+            json_match = re.search(r'```json\s*(.*?)\s*```', full_response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+                logger.info("Found JSON between ```json``` markers")
+            else:
+                # Try to find JSON between any triple backticks
+                json_match = re.search(r'```\s*(.*?)\s*```', full_response, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                    logger.info("Found JSON between ``` markers")
+                else:
+                    # Try to find JSON object directly with curly braces
+                    json_match = re.search(r'({[\s\S]*"steps"[\s\S]*})', full_response, re.DOTALL)
+                    if json_match:
+                        json_str = json_match.group(1)
+                        logger.info("Found JSON object with curly braces")
+                    else:
+                        # If all else fails, use the full response
+                        json_str = full_response
+                        logger.warning("Could not extract JSON, using full response")
+            
+            # Clean up the JSON string before parsing
+            json_str = json_str.strip()
+            # Remove any trailing commas before closing braces or brackets
+            json_str = re.sub(r',\s*}', '}', json_str)
+            json_str = re.sub(r',\s*]', ']', json_str)
+            
+            try:
+                curr_plan = json.loads(json_str)
+                logger.info("Successfully parsed JSON directly")
+            except json.JSONDecodeError:
+                # If direct parsing fails, try repair function
+                logger.warning("Direct JSON parsing failed, attempting repair")
+                curr_plan = json.loads(repair_json_output(json_str))
+        else:
+            curr_plan = json.loads(repair_json_output(full_response))
     except json.JSONDecodeError:
         logger.warning("Planner response is not a valid JSON")
         if plan_iterations > 0:
             return Command(goto="reporter")
         else:
             return Command(goto="__end__")
+            
     if curr_plan.get("has_enough_context"):
         logger.info("Planner response has enough context.")
         new_plan = Plan.model_validate(curr_plan)
@@ -263,12 +349,11 @@ def reporter_node(state: State):
     observations = state.get("observations", [])
 
     # Add a reminder about the new report format, citation style, and table usage
-    invoke_messages.append(
-        HumanMessage(
-            content="IMPORTANT: Structure your report according to the format in the prompt. Remember to include:\n\n1. Key Points - A bulleted list of the most important findings\n2. Overview - A brief introduction to the topic\n3. Detailed Analysis - Organized into logical sections\n4. Survey Note (optional) - For more comprehensive reports\n5. Key Citations - List all references at the end\n\nFor citations, DO NOT include inline citations in the text. Instead, place all citations in the 'Key Citations' section at the end using the format: `- [Source Title](URL)`. Include an empty line between each citation for better readability.\n\nPRIORITIZE USING MARKDOWN TABLES for data presentation and comparison. Use tables whenever presenting comparative data, statistics, features, or options. Structure tables with clear headers and aligned columns. Example table format:\n\n| Feature | Description | Pros | Cons |\n|---------|-------------|------|------|\n| Feature 1 | Description 1 | Pros 1 | Cons 1 |\n| Feature 2 | Description 2 | Pros 2 | Cons 2 |",
-            name="system",
-        )
+    format_instruction = HumanMessage(
+        content="IMPORTANT: Structure your report according to the format in the prompt. Remember to include:\n\n1. Key Points - A bulleted list of the most important findings\n2. Overview - A brief introduction to the topic\n3. Detailed Analysis - Organized into logical sections\n4. Survey Note (optional) - For more comprehensive reports\n5. Key Citations - List all references at the end\n\nFor citations, DO NOT include inline citations in the text. Instead, place all citations in the 'Key Citations' section at the end using the format: `- [Source Title](URL)`. Include an empty line between each citation for better readability.\n\nPRIORITIZE USING MARKDOWN TABLES for data presentation and comparison. Use tables whenever presenting comparative data, statistics, features, or options. Structure tables with clear headers and aligned columns. Example table format:\n\n| Feature | Description | Pros | Cons |\n|---------|-------------|------|------|\n| Feature 1 | Description 1 | Pros 1 | Cons 1 |\n| Feature 2 | Description 2 | Pros 2 | Cons 2 |",
+        name="system",
     )
+    invoke_messages.append(format_instruction)
 
     for observation in observations:
         invoke_messages.append(
@@ -277,9 +362,58 @@ def reporter_node(state: State):
                 name="observation",
             )
         )
+    
     logger.debug(f"Current invoke messages: {invoke_messages}")
-    response = get_llm_by_type(AGENT_LLM_MAP["reporter"]).invoke(invoke_messages)
-    response_content = response.content
+    
+    llm_type = AGENT_LLM_MAP["reporter"]
+    
+    if llm_type == "reasoning":
+        # For reasoning models like DeepSeek R1 or OpenAI O1
+        llm = get_llm_by_type(llm_type)
+        
+        # Add reasoning instructions for the reporter
+        reasoning_instruction = HumanMessage(
+            content=(
+                "Please think step by step to create a comprehensive research report. "
+                "\n\n"
+                "1. First, carefully analyze all the observations and research findings. "
+                "   - What are the key facts and insights from the research? "
+                "   - Are there any contradictions or gaps in the information? "
+                "   - What are the most significant patterns or trends? "
+                "\n\n"
+                "2. Then, organize the information into a coherent structure: "
+                "   - Group related information into logical sections "
+                "   - Determine the most effective sequence for presenting information "
+                "   - Identify where tables would be useful for comparing data "
+                "\n\n"
+                "3. For each section of your report: "
+                "   - Consider what evidence supports your conclusions "
+                "   - Evaluate the reliability and relevance of different sources "
+                "   - Determine how to present complex information clearly "
+                "\n\n"
+                "4. Finally, write a well-structured report following the format specified above, with: "
+                "   - Clear, concise key points at the beginning "
+                "   - A logical flow from introduction to detailed analysis "
+                "   - Effective use of markdown tables for comparative data "
+                "   - Proper citations in the Key Citations section "
+                "\n\n"
+                "Take your time to reason through each step before writing the final report."
+            ),
+            name="system",
+        )
+        invoke_messages.append(reasoning_instruction)
+        
+        # Stream the response for reasoning models to handle potentially longer outputs
+        full_response = ""
+        response_stream = llm.stream(invoke_messages)
+        for chunk in response_stream:
+            full_response += chunk.content
+        response_content = full_response
+    else:
+        # For basic models
+        response = get_llm_by_type(llm_type).invoke(invoke_messages)
+        response_content = response.content
+    
     logger.info(f"reporter response: {response_content}")
 
     return {"final_report": response_content}
