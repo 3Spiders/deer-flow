@@ -1,0 +1,41 @@
+# Example configuration for using reasoning models in deer-flow
+# This configuration shows how to set up DeepSeek R1 and OpenAI O1 models
+
+# Basic model configuration - can be any model that supports chat completions
+BASIC_MODEL:
+  model: "gpt-3.5-turbo"
+  api_key: "your_openai_api_key"
+  temperature: 0.1
+  max_tokens: 4000
+
+# DeepSeek R1 configuration
+REASONING_MODEL:
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-reasoner"
+  api_key: "your_deepseek_api_key"
+  temperature: 0.1
+  max_tokens: 4000
+
+# Alternative OpenAI O1 configuration
+# Uncomment to use OpenAI O1 instead of DeepSeek R1
+# REASONING_MODEL:
+#   model: "o1"
+#   api_key: "your_openai_api_key"
+#   temperature: 0.1
+#   max_tokens: 4000
+
+# Vision model configuration (if needed)
+VISION_MODEL:
+  model: "gpt-4-vision-preview"
+  api_key: "your_openai_api_key"
+  temperature: 0.1
+  max_tokens: 4000
+
+# Search configuration
+SEARCH_ENGINE: "tavily"  # or "google"
+MAX_SEARCH_RESULTS: 5
+
+# Agent configuration
+MAX_PLAN_ITERATIONS: 3
+ENABLE_BACKGROUND_INVESTIGATION: true
+AUTO_ACCEPTED_PLAN: false
